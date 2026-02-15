@@ -270,10 +270,14 @@ def generate_report_node(state: SQLAnalysisState):
     report = []
     
     # ------------------------------------
-    # 區塊 1: Target Table
+    # 區塊 1: Target Table (Markdown)
     # ------------------------------------
-    report.append(f"target table : {final_target}")
-    report.append("target column:")
+    report.append(f"# 🎯 SQL 血緣追溯報告")
+    report.append("")
+    report.append(f"## 目標表 (Target Table): `{final_target}`")
+    report.append("")
+    report.append("| 欄位名稱 | 業務描述 | 完整來源路徑 |")
+    report.append("|----------|----------|-------------|")
     
     t_key = next((k for k in metadata if k.lower() == final_target.lower()), None)
     if t_key:
@@ -281,38 +285,47 @@ def generate_report_node(state: SQLAnalysisState):
             desc = col_info["description"]
             paths = get_source_path(final_target, col_name)
             src_str = " , ".join(paths) if paths else "Unknown"
-            report.append(f"- {col_name} : {desc}, source : {src_str}")
+            report.append(f"| `{col_name}` | {desc} | {src_str} |")
     else:
-        report.append("- (無欄位資訊)")
+        report.append("| - | (無欄位資訊) | - |")
         
     report.append("")
     
     # ------------------------------------
-    # 區塊 2: Temp Table List
+    # 區塊 2: Temp Table List (Markdown)
     # ------------------------------------
-    report.append("temp table list : ")
+    report.append("## 🗂️ 中繼表清單 (Temp Tables)")
+    report.append("")
     idx = 1
-    for t_name, t_info in metadata.items():
-        if t_name.lower() == final_target.lower(): continue
+    # 反轉順序：原始 metadata 是由後往前分析的，報告改為由前往後呈現
+    temp_tables = [(t_name, t_info) for t_name, t_info in metadata.items()
+                   if t_name.lower() != final_target.lower()]
+    temp_tables.reverse()
+    
+    for t_name, t_info in temp_tables:
             
         desc = t_info["description"]
-        report.append(f"{idx}. {t_name} ... {desc}")
-        report.append("- column : ")
+        report.append(f"### {idx}. `{t_name}` — {desc}")
+        report.append("")
+        report.append("| 欄位名稱 | 業務描述 | 完整來源路徑 |")
+        report.append("|----------|----------|-------------|")
         
         for col_name, col_info in t_info["columns"].items():
             c_desc = col_info["description"]
             paths = get_source_path(t_name, col_name)
             src_str = " , ".join(paths) if paths else "Unknown"
-            report.append(f"  - {col_name} : {c_desc} .., source : {src_str}")
+            report.append(f"| `{col_name}` | {c_desc} | {src_str} |")
             
+        report.append("")
         idx += 1
-        
-    report.append("")
     
     # ------------------------------------
-    # 區塊 3: 最終流程圖 (Flowchart)
+    # 區塊 3: LLM 生成 Mermaid 流程圖
     # ------------------------------------
-    report.append("最終會有流程圖: ")
+    report.append("## 📊 資料流程圖 (Data Lineage Flowchart)")
+    report.append("")
+    
+    # 組裝依賴關係描述，交給 LLM 產生 Mermaid
     deps = {}
     for t_name, t_info in metadata.items():
         src_tables = set()
@@ -323,24 +336,73 @@ def generate_report_node(state: SQLAnalysisState):
                     src_tables.add(src_t)
         if src_tables:
             deps[t_name.upper()] = src_tables
-            
-    # 將依賴關係反轉為 Source ---> Target1, Target2 的流向
-    flow_map = {}
-    for tgt, srcs in deps.items():
-        for s in srcs:
-            if s not in flow_map: flow_map[s] = set()
-            flow_map[s].add(tgt)
-            
-    for s, tgts in flow_map.items():
-        tgt_str = ", ".join(sorted(list(tgts)))
-        report.append(f"{s} ---> {tgt_str}")
+    
+    if deps:
+        # 構建依賴描述文字（含表描述，讓 Mermaid 節點顯示說明）
+        dep_lines = []
+        for tgt, srcs in deps.items():
+            for s in srcs:
+                dep_lines.append(f"{s} --> {tgt}")
+        dep_text = "\n".join(dep_lines)
+        
+        # 蒐集各表描述，傳給 LLM 讓節點帶說明
+        table_descs = []
+        for t_name, t_info in metadata.items():
+            desc = t_info.get("description", "")
+            if desc:
+                table_descs.append(f"{t_name}: {desc}")
+        desc_text = "\n".join(table_descs)
+        
+        logger.info("   🎨 呼叫 LLM 生成 Mermaid 流程圖...")
+        llm = build_llm(temperature=0.0)
+        mermaid_prompt = ChatPromptTemplate.from_messages([
+            ("system", """你是一位資料視覺化專家。根據以下的表依賴關係與表描述，生成一段 Mermaid flowchart 語法。
+規則：
+1. 使用 `graph LR`（從左至右）排列。
+2. 實體表 (不以 # 開頭) 使用圓角矩形，節點標籤格式為 `(["表名\n描述"])`。
+3. 暫存表 (以 # 開頭) 使用方框，節點標籤格式為 `["表名\n描述"]`。
+4. 最終目標表用加粗雙框 `[["表名\n描述"]]` 標示。
+5. 只需要回傳純 Mermaid 語法，不要加 ```mermaid 標記，不要加任何解釋文字。
+6. 為暫存表節點使用不含 # 的 ID，例如 `LP["#LP\n篩選基礎資料"]`。
+7. 若表沒有描述，則只寫表名即可。"""),
+            ("user", """目標表: {target}
 
+依賴關係:
+{deps}
+
+各表描述:
+{descs}
+
+請生成 Mermaid flowchart。""")
+        ])
+        
+        mermaid_result = llm.invoke(mermaid_prompt.format_messages(
+            target=final_target, deps=dep_text, descs=desc_text
+        ))
+        mermaid_code = mermaid_result.content.strip()
+        
+        # 清理 LLM 可能多加的 markdown 標記
+        if mermaid_code.startswith("```"):
+            lines = mermaid_code.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            mermaid_code = "\n".join(lines)
+        
+        report.append("```mermaid")
+        report.append(mermaid_code)
+        report.append("```")
+    else:
+        report.append("*（無跨表依賴關係，無需流程圖）*")
+
+    report.append("")
+    report.append("---")
+    report.append("*此報告由 SQL-Chronos 自動生成*")
+    
     final_report = "\n".join(report)
     
-    with open("Report.txt", "w", encoding="utf-8") as f:
+    with open("Report.md", "w", encoding="utf-8") as f:
         f.write(final_report)
         
-    logger.info("   ✅ 完美格式的 Report.txt 產生完畢！")
+    logger.info("   ✅ 完美格式的 Report.md 產生完畢！")
     return {"final_report": final_report}
 
 # ==========================================
@@ -397,6 +459,6 @@ if __name__ == "__main__":
     result = app.invoke(initial_state)
 
     print("\n" + "="*60)
-    print("🏁 全部追溯完成！以下為 Report.txt 產出預覽：")
+    print("🏁 全部追溯完成！以下為 Report.md 產出預覽：")
     print("="*60 + "\n")
     print(result["final_report"])
