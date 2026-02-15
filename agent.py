@@ -239,6 +239,26 @@ def generate_report_node(state: SQLAnalysisState):
     final_target = state.get("final_target", "Unknown")
     
     # 🌟 核心：遞迴尋路演算法，負責自動串接 #LP ---> #CT ---> 底層table
+    def _dedup_paths(paths: list) -> list:
+        """移除重複子路徑：若 A 是 B 的尾段子串，則 A 是冗餘的"""
+        if not paths: return paths
+        
+        # 1. 先濾掉 Loop Detected（若有其他有效路徑）
+        valid = [p for p in paths if "[Loop Detected]" not in p]
+        candidates = valid if valid else paths
+        
+        # 2. 移除被更長路徑包含的子路徑
+        filtered = []
+        for p in candidates:
+            is_subpath = any(
+                other != p and other.endswith(f" ---> {p}")
+                for other in candidates
+            )
+            if not is_subpath:
+                filtered.append(p)
+        
+        return filtered if filtered else candidates
+    
     def get_source_path(table: str, col: str, visited=None) -> list:
         if visited is None: visited = set()
         node_key = f"{table}.{col}".lower()
@@ -265,7 +285,8 @@ def generate_report_node(state: SQLAnalysisState):
             else:
                 paths.append(f"{src_tb}")
                 
-        return list(dict.fromkeys(paths))
+        # 去重 + 移除冗餘子路徑
+        return _dedup_paths(list(dict.fromkeys(paths)))
 
     report = []
     
