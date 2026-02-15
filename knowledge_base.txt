@@ -1,0 +1,2 @@
+【T_Stock 表】: 實體庫存表，Status='A' 表示良品。
+【T_Price 表】: 報價主檔。
