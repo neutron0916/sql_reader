@@ -1,9 +1,9 @@
 import logging
 import os
 import re
-import operator
+import copy
 import warnings
-from typing import TypedDict, List, Dict, Any, Annotated
+from typing import TypedDict, List, Dict, Any
 
 import httpx
 from dotenv import load_dotenv
@@ -25,11 +25,11 @@ warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 
 def build_llm(temperature: float | None = None) -> ChatOpenAI:
-    """建立 LLM（保留你的企業級 API 配置）"""
+    """保留企業級設定，預設溫度設為 0 以確保血緣精準對齊"""
     base_url = os.getenv("OPENAI_COMPAT_BASE_URL", "https://model-gateway.gclpgenaigw.gc.micron.com/api/v1")
     api_key = os.getenv("OPENAI_COMPAT_API_KEY", "sk-dummy-key")
     model = os.getenv("OPENAI_COMPAT_MODEL", "gpt-5.2-codex")
-    default_temperature = float(os.getenv("OPENAI_COMPAT_TEMPERATURE", "0.1")) # 建議低溫以確保邏輯精準
+    default_temperature = float(os.getenv("OPENAI_COMPAT_TEMPERATURE", "0.0"))
     max_tokens_str = os.getenv("OPENAI_COMPAT_MAX_TOKENS", "")
     thinking_level = os.getenv("GEMINI_THINKING_LEVEL", "HIGH")
     disable_ssl_verify = os.getenv("OPENAI_COMPAT_VERIFY_SSL", "false").lower() in {"0", "false", "no"}
@@ -58,57 +58,46 @@ def build_llm(temperature: float | None = None) -> ChatOpenAI:
     return ChatOpenAI(**kwargs)
 
 # ==========================================
-# 🧠 1. 定義狀態與強型別輸出 (Pydantic)
+# 🧠 1. 定義狀態記憶體與 Pydantic
 # ==========================================
 class SQLAnalysisState(TypedDict):
     raw_sql: str
     chunks: List[str]
-    current_chunk_index: int       # 🌟 從最後一塊往前遞減 (Reverse Reading)
+    current_chunk_index: int
     
-    # 動態狀態維護
-    final_target: str              # 記錄最末端的最終表
-    pending_list: List[str]        # 🌟 動態擴充的「待尋找來源」Temp Table 清單
-    processed_list: List[str]      # 記錄已解析過的表，避免重疊 Chunk 造成重複解析
-    current_depth: int
-    step_count: int
+    final_target: str
+    pending_list: List[str]
+    processed_list: List[str]
     
-    existing_kb: str
-    report_steps: Annotated[List[str], operator.add] # 累積的報告段落
+    # 🌟 核心：取代流水帳，這是一個全域「表與欄位關係」的 Graph 字典
+    table_metadata: Dict[str, Any] 
+    
     parsed_result: Dict[str, Any]
+    final_report: str
 
-class SourceTable(BaseModel):
-    table_name: str = Field(description="來源表名 (例如 #Temp_B, ORD_HDR)")
-    original_column: str = Field(description="對應的原始欄位名 (可為多個欄位或 *)")
-    is_physical: bool = Field(description="是否為實體表 (判斷標準：非 # 開頭，且非 CTE，通常是底層實體表)")
+class SourceColumn(BaseModel):
+    table_name: str = Field(description="來源表名 (例如 #LP, ORD_HDR)")
+    column_name: str = Field(description="來源欄位名")
+    is_physical: bool = Field(description="是否為實體表 (非 # 開頭且非 CTE)")
 
-class BPLogic(BaseModel):
-    core_function: str = Field(description="核心功能：請用人類語言描述這張表在做什麼，例如：計算客戶去年的總消費額")
-    key_transformation: str = Field(description="關鍵轉換：記錄 CASE WHEN, COALESCE 或聚合邏輯")
-    field_meaning: str = Field(description="欄位意義：根據上下文推測此欄位的業務價值")
+class TargetColumn(BaseModel):
+    column_name: str = Field(description="產出的目標欄位名稱")
+    description: str = Field(description="欄位的業務意義與轉換邏輯 (des)")
+    sources: List[SourceColumn] = Field(description="此欄位依賴的『直接』來源表與欄位")
 
-class ParsedLayer(BaseModel):
-    target_table: str = Field(description="在此區塊中被產出/寫入的目標表名 (例如 #Temp_C 或最終報表)")
-    target_column_alias: str = Field(description="在此層中關注的核心欄位名稱")
-    sources: List[SourceTable] = Field(description="所有貢獻來源 (多對一 JOIN 或 UNION 必須列出所有來源表)")
-    bp_logic: BPLogic
-    is_fully_resolved: bool = Field(description="是否在此步驟完全定義了此表 (例如 CREATE TABLE, SELECT INTO)。若是 UPDATE 則設為 False。")
-
-class KBTable(BaseModel):
-    table_name: str = Field(description="實體表名")
-    business_desc: str = Field(description="業務用途描述")
-    granularity: str = Field(description="數據粒度 (Granularity)")
-    remarks: str = Field(description="備註 (若與現有知識庫矛盾請標註)")
+class ParsedTable(BaseModel):
+    table_name: str = Field(description="被建立或寫入的目標表名")
+    table_description: str = Field(description="這張表的核心功能描述 (des)")
+    is_fully_resolved: bool = Field(description="是否為完整建立(CREATE/INTO/CTE)。若是 UPDATE 則填 False")
+    columns: List[TargetColumn] = Field(description="表內欄位定義與來源")
 
 class ChunkParseResult(BaseModel):
-    found_layers: List[ParsedLayer] = Field(description="在此 Chunk 中找到的所有資料寫入層。請務必按照 SQL 語句「由上往下」的出現順序排列！")
-    kb_tables: List[KBTable] = Field(description="提煉出的實體表通用知識")
-    patterns: List[str] = Field(description="記錄重複出現的公式或過濾習慣")
+    found_tables: List[ParsedTable] = Field(description="此 SQL 區塊中建立/更新的所有表")
 
 # ==========================================
-# ⚙️ 2. 工具與 Nodes
+# ⚙️ 2. 解析與圖表建立 Nodes
 # ==========================================
 def chunk_mssql_sql(raw_sql: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
-    """保留你的切塊邏輯：依標記或滑動視窗切塊"""
     lines = raw_sql.splitlines()
     marker_pattern = re.compile(r"^\s*---\s*CHUNK\s+BOUNDARY\s*---")
     
@@ -133,211 +122,229 @@ def chunk_mssql_sql(raw_sql: str, chunk_size: int = 500, overlap: int = 100) -> 
     return chunks
 
 def init_node(state: SQLAnalysisState):
-    """【Step 1】檔案切塊，並將指標設定在最後一塊 (Bottom-Up)"""
     logger.info("🟢 [NODE] init_node — 讀取 SQL 並切塊")
-    raw_sql = state["raw_sql"]
-    
-    chunks = chunk_mssql_sql(raw_sql)
-    logger.info(f"   📦 共切分為 {len(chunks)} 個區塊，將從 Chunk {len(chunks)} 開始「由下往上」逆向讀取！")
-    
-    # 建立或讀取 Knowledge_Base.md
-    kb_path = "Knowledge_Base.md"
-    if os.path.exists(kb_path):
-        with open(kb_path, "r", encoding="utf-8") as f: existing_kb = f.read()
-    else:
-        existing_kb = "Table Dictionary:\n| 實體表名 | 業務用途描述 | 數據粒度 (Granularity) | 備註 |\n| :--- | :--- | :--- | :--- |\n\nPattern Recognition:\n"
-            
-    # 初始化 Report.txt (清空舊檔案確保全新追溯)
-    with open("Report.txt", "w", encoding="utf-8") as f:
-        f.write("[Analysis Status]\n- 系統啟動中...\n---\n")
-
+    chunks = chunk_mssql_sql(state["raw_sql"])
     return {
         "chunks": chunks,
-        "current_chunk_index": len(chunks) - 1,  # 🌟 核心：指標指向最後一塊
+        "current_chunk_index": len(chunks) - 1, # 指標指向最底層
         "final_target": "Unknown",
-        "pending_list": [],                      # 一開始是空的，靠讀取慢慢產生
+        "pending_list": [],
         "processed_list": [],
-        "current_depth": 0,
-        "step_count": 0,
-        "report_steps": [],
-        "existing_kb": existing_kb
+        "table_metadata": {}
     }
 
 def analyze_backward_chunk_node(state: SQLAnalysisState):
-    """【Step 2】解析 (Parse)：由後往前讀取 Chunk，動態推演 Pending List"""
     idx = state["current_chunk_index"]
     current_chunk = state["chunks"][idx]
     pending_list = state.get("pending_list", [])
     
-    logger.info(f"\n{'='*60}\n🟢 [NODE] analyze_backward_chunk — 正在解析 Chunk {idx+1}/{len(state['chunks'])}")
-    logger.info(f"   🔍 目前尋找來源的 Pending List: {pending_list if pending_list else '[] (正在抓取最底層 Final Target)'}")
+    logger.info(f"\n{'='*60}\n🟢 [NODE] analyze_chunk — 解析 Chunk {idx+1}/{len(state['chunks'])}")
+    logger.info(f"   🔍 待尋找來源之 Temp Tables: {pending_list}")
 
-    llm = build_llm(temperature=0.1)
+    llm = build_llm(temperature=0.0)
     structured_llm = llm.with_structured_output(ChunkParseResult)
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", """你是一位頂尖的資料工程師。我們正在「由後往前 (Bottom-Up)」逆向閱讀 SQL。
-        
-        【任務規則與思考邏輯】：
-        1. 找出這個區塊中「被寫入、被建立或被更新」的目標表 (Target Table)。
-        2. 你的思考邏輯必須是：Target <--- #TempC <--- #TempB <--- Source Table。
-        3. 【動態尋找】：目前的 Pending List 為 {pending_list}。
-           - 若 Pending List 為空，請找出這個 Chunk 產出的「最終目標表 (Final Target)」，並解析它的來源。
-           - 若 Pending List 不為空，請優先尋找這些 Temp Table 在此區塊中是否被建立或更新。
-        4. 【多對一處理】：若表由多個表 JOIN 或 UNION 而成，必須將「所有來源表」加入 sources 清單。嚴禁漏掉！
-        5. 將找到的轉換步驟，按照在 SQL 語句中「由上往下」的出現順序排列在 found_layers 中。
-        6. 【知識對齊】：觸碰到實體表 (Physical Table，非 # 開頭) 時，優先參考並擴充知識庫：
-        
-        {existing_kb}
+        【任務規則】：
+        1. 找出區塊中被建立/更新的目標表。若 Pending List {pending_list} 不為空，優先尋找它們。若為空，找出最終產出表。
+        2. 針對目標表，精準解析【各個欄位】直接來自哪個來源表與來源欄位。
+        3. 【多對一處理】：若欄位由多表 JOIN / 運算而成，必須將所有來源列入 sources。
         """),
         ("user", "【當前 SQL 區塊】:\n{chunk}")
     ])
     
-    logger.info("   ⏳ 呼叫 LLM 進行逆向血緣推演...")
     result: ChunkParseResult = structured_llm.invoke(prompt.format_messages(
-        pending_list=pending_list,
-        existing_kb=state["existing_kb"],
-        chunk=current_chunk
+        pending_list=pending_list, chunk=current_chunk
     ))
-    
     return {"parsed_result": result.model_dump()}
 
 def update_node(state: SQLAnalysisState):
-    """【Step 3】增量更新 (Update)：過濾結果、動態維護 Pending List，寫入實體檔案"""
-    logger.info("🟢 [NODE] update_node — 狀態維護與檔案寫入")
+    logger.info("🟢 [NODE] update_node — 將依賴關係寫入記憶體 Graph")
     
     parsed = ChunkParseResult(**state.get("parsed_result", {}))
     pending_list = state.get("pending_list", []).copy()
     processed_list = state.get("processed_list", []).copy()
     final_target = state.get("final_target", "Unknown")
-    step_count = state.get("step_count", 0)
-    current_depth = state.get("current_depth", 0)
+    table_metadata = copy.deepcopy(state.get("table_metadata", {}))
     
-    new_report_steps = []
+    # 反轉以確保同 Chunk 內的 CTE/TEMP 先後順序正常
+    parsed_tables = parsed.found_tables.copy()
+    parsed_tables.reverse()
     
-    # 🌟 核心：雖然我們是「由下往上」讀 Chunk，但 LLM 讀取單一 Chunk 內部是 Top-Down。
-    # 因此我們必須在 Python 端反轉 parsed.layers，確保 Chunk 內部的 CTE 或連鎖更新能無縫溯源。
-    parsed_layers = parsed.found_layers.copy()
-    parsed_layers.reverse()
-    
-    for layer in parsed_layers:
-        target = layer.target_table
+    for layer in parsed_tables:
+        target = layer.table_name
         is_relevant = False
         
-        # 情況 1：剛啟動，抓取最底層的 Final Target
         if final_target == "Unknown" and not pending_list:
             final_target = target
             is_relevant = True
-            logger.info(f"   🎯 自動鎖定最終目標表 (Final Target): {final_target}")
-        # 情況 2：命中 Pending List 裡的表，代表我們找到它的上游來源了！
         elif target.lower() in [p.lower() for p in pending_list]:
             is_relevant = True
 
         if is_relevant:
-            # 層次遞歸：如果是 CREATE/INTO 這種完全解析的，將其移出佇列；若是 UPDATE 則保留繼續往上查。
-            if target.lower() in [p.lower() for p in pending_list]:
-                if layer.is_fully_resolved:
-                    pending_list = [p for p in pending_list if p.lower() != target.lower()]
-                    logger.info(f"   ✅ {target} 已完全解析，移出 Pending List")
-                else:
-                    logger.info(f"   ⚠️ {target} 僅為部分更新，保留在 Pending List 繼續往上追溯")
-            
-            # 防止切塊 Overlap 造成重複解析
-            if layer.is_fully_resolved and target.lower() not in [p.lower() for p in processed_list]:
-                processed_list.append(target.lower())
+            if layer.is_fully_resolved:
+                pending_list = [p for p in pending_list if p.lower() != target.lower()]
+                if target.lower() not in processed_list:
+                    processed_list.append(target.lower())
+                    
+            if target not in table_metadata:
+                table_metadata[target] = {
+                    "description": layer.table_description,
+                    "columns": {}
+                }
                 
-            step_count += 1
-            current_depth += 1
-            
-            source_desc_list = []
-            for src in layer.sources:
-                source_desc_list.append(f"{src.table_name}.{src.original_column}")
-                # 強制路徑完整：將未處理過的非實體來源表，通通推進 Pending List
-                if not src.is_physical:
-                    if src.table_name.lower() not in [p.lower() for p in processed_list] and \
-                       src.table_name.lower() not in [p.lower() for p in pending_list] and \
-                       src.table_name.lower() != target.lower(): # 避免自迴圈
-                        pending_list.append(src.table_name)
-                        logger.info(f"   ➕ 新增待追溯 Temp Table: {src.table_name}")
-                        
-            # 組合 Report Step (強制鎖死 Markdown 格式，不給 LLM 發揮)
-            step_text = f"### [Step {step_count}: Layer Analysis]\n"
-            step_text += f"- **Current Table**: {target}\n"
-            step_text += f"- **Target Column Alias**: {layer.target_column_alias}\n"
-            step_text += f"- **Source From**: {', '.join(source_desc_list)}\n"
-            step_text += "- **BP Logic (業務轉譯)**: \n"
-            step_text += f"    * 核心功能：{layer.bp_logic.core_function}\n"
-            step_text += f"    * 關鍵轉換：{layer.bp_logic.key_transformation}\n"
-            step_text += f"    * 欄位意義：{layer.bp_logic.field_meaning}\n"
-            step_text += "---\n"
-            
-            new_report_steps.append(step_text)
-
-    # ==========================
-    # 寫入 Report.txt (短期記憶覆寫)
-    # ==========================
-    pending_str = f"[{', '.join(pending_list)}]"
-    full_report_header = f"""[Analysis Status]
-- Final Target: {final_target}
-- Current Tracing Depth: Level {current_depth} (0 為最末端)
-- Pending List: {pending_str} (目前還在追溯中、尚未找到來源的表)
-
----
-"""
-    # 結合 Annotated 自動累加的歷史 steps 寫入
-    all_steps = "".join(state.get("report_steps", []) + new_report_steps)
-    with open("Report.txt", "w", encoding="utf-8") as f:
-        f.write(full_report_header + all_steps)
-    
-    # ==========================
-    # 寫入 Knowledge_Base.md (長期資產擴充)
-    # ==========================
-    kb_lines = state["existing_kb"].splitlines()
-    pattern_idx = next((i for i, line in enumerate(kb_lines) if "Pattern Recognition:" in line), -1)
-    if pattern_idx == -1:
-        kb_lines.append("\nPattern Recognition:")
-        pattern_idx = len(kb_lines) - 1
-        
-    for kb in parsed.kb_tables:
-        line = f"| {kb.table_name} | {kb.business_desc} | {kb.granularity} | {kb.remarks} |"
-        if not any(kb.table_name in l for l in kb_lines[:pattern_idx]):
-            kb_lines.insert(pattern_idx, line)
-            pattern_idx += 1
-            
-    for pat in parsed.patterns:
-        line = f"- {pat}"
-        if line not in kb_lines: kb_lines.append(line)
-            
-    new_kb_content = "\n".join(kb_lines)
-    with open("Knowledge_Base.md", "w", encoding="utf-8") as f:
-        f.write(new_kb_content)
-        
-    logger.info(f"   ✅ Chunk 處理完畢，檔案已即時寫入。")
+            # 欄位解析與儲存 (包含 UPDATE 語句的欄位合併)
+            for col in layer.columns:
+                col_name = col.column_name
+                sources_list = [{"table": s.table_name, "column": s.column_name} for s in col.sources]
+                
+                if col_name not in table_metadata[target]["columns"]:
+                    table_metadata[target]["columns"][col_name] = {
+                        "description": col.description,
+                        "sources": sources_list
+                    }
+                else:
+                    for s in sources_list:
+                        if s not in table_metadata[target]["columns"][col_name]["sources"]:
+                            table_metadata[target]["columns"][col_name]["sources"].append(s)
+                            
+                # 將未處理的來源表推入 Pending List
+                for s in col.sources:
+                    s_name = s.table_name
+                    if not s.is_physical and s_name.lower() not in processed_list and s_name.lower() not in [p.lower() for p in pending_list] and s_name.lower() != target.lower():
+                        pending_list.append(s_name)
 
     return {
-        "current_chunk_index": state["current_chunk_index"] - 1, # 🌟 推進迴圈：往上溯源
+        "current_chunk_index": state["current_chunk_index"] - 1,
         "pending_list": pending_list,
         "processed_list": processed_list,
         "final_target": final_target,
-        "step_count": step_count,
-        "current_depth": current_depth,
-        "existing_kb": new_kb_content,
-        "report_steps": new_report_steps  # 交由 Annotated 進行自動陣列累加
+        "table_metadata": table_metadata
     }
 
 def router_check_continue(state: SQLAnalysisState) -> str:
-    """【條件路由】判斷是否所有 Chunk (由下往上) 都讀完了"""
-    idx = state["current_chunk_index"]
-    
-    if idx >= 0:
-        logger.info(f"🔀 [ROUTER] 繼續往上溯源 Chunk {idx+1}")
+    if state["current_chunk_index"] >= 0:
         return "analyze_backward_chunk"
-    
-    logger.info("🏁 [ROUTER] 已讀取至檔案最頂端，血緣追溯完成！進入 END")
-    return END
+    logger.info("🏁 [ROUTER] 全文溯源完畢，進入報表渲染階段！")
+    return "generate_report"
 
 # ==========================================
-# 🕸️ 3. 編譯 LangGraph 工作流
+# 📊 3. 終極報表生成 (遞迴 DFS 尋路演算法)
+# ==========================================
+def generate_report_node(state: SQLAnalysisState):
+    logger.info("\n🟢 [NODE] generate_report_node — 展開血緣樹並產生格式化藍圖")
+    
+    metadata = state.get("table_metadata", {})
+    final_target = state.get("final_target", "Unknown")
+    
+    # 🌟 核心：遞迴尋路演算法，負責自動串接 #LP ---> #CT ---> 底層table
+    def get_source_path(table: str, col: str, visited=None) -> list:
+        if visited is None: visited = set()
+        node_key = f"{table}.{col}".lower()
+        if node_key in visited: return ["[Loop Detected]"]
+        visited.add(node_key)
+        
+        t_key = next((k for k in metadata if k.lower() == table.lower()), None)
+        if not t_key: return []
+        
+        c_key = next((k for k in metadata[t_key]["columns"] if k.lower() == col.lower()), None)
+        if not c_key: return []
+        
+        sources = metadata[t_key]["columns"][c_key]["sources"]
+        paths = []
+        for src in sources:
+            src_tb = src["table"]
+            src_col = src["column"]
+            sub_paths = get_source_path(src_tb, src_col, visited.copy())
+            
+            # 若它還有來源，將其用 ---> 串接起來
+            if sub_paths:
+                for sp in sub_paths:
+                    paths.append(f"{src_tb} ---> {sp}")
+            else:
+                paths.append(f"{src_tb}")
+                
+        return list(dict.fromkeys(paths))
+
+    report = []
+    
+    # ------------------------------------
+    # 區塊 1: Target Table
+    # ------------------------------------
+    report.append(f"target table : {final_target}")
+    report.append("target column:")
+    
+    t_key = next((k for k in metadata if k.lower() == final_target.lower()), None)
+    if t_key:
+        for col_name, col_info in metadata[t_key]["columns"].items():
+            desc = col_info["description"]
+            paths = get_source_path(final_target, col_name)
+            src_str = " , ".join(paths) if paths else "Unknown"
+            report.append(f"- {col_name} : {desc}, source : {src_str}")
+    else:
+        report.append("- (無欄位資訊)")
+        
+    report.append("")
+    
+    # ------------------------------------
+    # 區塊 2: Temp Table List
+    # ------------------------------------
+    report.append("temp table list : ")
+    idx = 1
+    for t_name, t_info in metadata.items():
+        if t_name.lower() == final_target.lower(): continue
+            
+        desc = t_info["description"]
+        report.append(f"{idx}. {t_name} ... {desc}")
+        report.append("- column : ")
+        
+        for col_name, col_info in t_info["columns"].items():
+            c_desc = col_info["description"]
+            paths = get_source_path(t_name, col_name)
+            src_str = " , ".join(paths) if paths else "Unknown"
+            report.append(f"  - {col_name} : {c_desc} .., source : {src_str}")
+            
+        idx += 1
+        
+    report.append("")
+    
+    # ------------------------------------
+    # 區塊 3: 最終流程圖 (Flowchart)
+    # ------------------------------------
+    report.append("最終會有流程圖: ")
+    deps = {}
+    for t_name, t_info in metadata.items():
+        src_tables = set()
+        for col_info in t_info["columns"].values():
+            for src in col_info["sources"]:
+                src_t = src["table"].upper()
+                if src_t != t_name.upper():
+                    src_tables.add(src_t)
+        if src_tables:
+            deps[t_name.upper()] = src_tables
+            
+    # 將依賴關係反轉為 Source ---> Target1, Target2 的流向
+    flow_map = {}
+    for tgt, srcs in deps.items():
+        for s in srcs:
+            if s not in flow_map: flow_map[s] = set()
+            flow_map[s].add(tgt)
+            
+    for s, tgts in flow_map.items():
+        tgt_str = ", ".join(sorted(list(tgts)))
+        report.append(f"{s} ---> {tgt_str}")
+
+    final_report = "\n".join(report)
+    
+    with open("Report.txt", "w", encoding="utf-8") as f:
+        f.write(final_report)
+        
+    logger.info("   ✅ 完美格式的 Report.txt 產生完畢！")
+    return {"final_report": final_report}
+
+# ==========================================
+# 🕸️ 4. 編譯 LangGraph 工作流
 # ==========================================
 def build_graph():
     workflow = StateGraph(SQLAnalysisState)
@@ -345,25 +352,26 @@ def build_graph():
     workflow.add_node("init", init_node)
     workflow.add_node("analyze_backward_chunk", analyze_backward_chunk_node)
     workflow.add_node("update", update_node)
+    workflow.add_node("generate_report", generate_report_node)
     
     workflow.add_edge(START, "init")
     workflow.add_edge("init", "analyze_backward_chunk")
     workflow.add_edge("analyze_backward_chunk", "update")
     
-    # 迴圈控制：判斷是否繼續往上讀
     workflow.add_conditional_edges(
         "update",
         router_check_continue,
         {
             "analyze_backward_chunk": "analyze_backward_chunk",
-            END: END
+            "generate_report": "generate_report"
         }
     )
+    workflow.add_edge("generate_report", END)
     
     return workflow.compile()
 
 # ==========================================
-# 🚀 4. 執行測試範例
+# 🚀 5. 執行入口
 # ==========================================
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -373,28 +381,22 @@ if __name__ == "__main__":
         with open(sql_path, "r", encoding="utf-8") as f:
             raw_sql = f.read()
     except FileNotFoundError:
-        print(f"⚠️ 找不到 {sql_path}，使用測試 SQL 模擬 Bottom-Up 溯源。")
+        print(f"⚠️ 找不到 {sql_path}，使用測試 SQL 模擬。")
         raw_sql = """
-        -- 最上面的程式碼 (實體表撈取)
-        SELECT ID, Amt INTO #TempA FROM Physical_T1;
-        
+        SELECT ID, Dept INTO #LP FROM Base_Dept;
         --- CHUNK BOUNDARY ---
-        -- 中間的程式碼 (轉換，依賴 #TempA)
-        SELECT a.ID, a.Amt, b.Name INTO #TempB FROM #TempA a JOIN Physical_T2 b ON a.ID = b.ID;
-        
+        SELECT a.ID, a.Dept, b.Salary INTO #CT FROM #LP a JOIN Base_Salary b ON a.ID = b.ID;
         --- CHUNK BOUNDARY ---
-        -- 最下面的程式碼 (AI 會先讀這裡，自動鎖定 FinalTarget 並推演 #TempB 入 Queue)
-        SELECT Name, SUM(Amt) AS Total INTO FinalTarget FROM #TempB GROUP BY Name;
+        SELECT Dept, SUM(Salary) AS Total_Salary INTO Final_Report FROM #CT GROUP BY Dept;
         """
 
     initial_state = {"raw_sql": raw_sql}
 
-    print("🚀 啟動 SQL-Chronos (逆向 Chunk 溯源模式)...")
+    print("🚀 啟動 SQL-Chronos (遞迴圖論溯源模式)...")
     app = build_graph()
-    app.invoke(initial_state)
+    result = app.invoke(initial_state)
 
     print("\n" + "="*60)
-    print("🏁 全部追溯完成！")
-    print("👉 你的 Pending List 與 Target 皆是由 AI 在逆推時動態捕捉出來的！")
-    print("👉 請查看目錄下的 `Report.txt` 與 `Knowledge_Base.md`")
+    print("🏁 全部追溯完成！以下為 Report.txt 產出預覽：")
     print("="*60 + "\n")
+    print(result["final_report"])
