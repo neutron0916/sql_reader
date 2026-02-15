@@ -1,4 +1,6 @@
 import json
+import os
+import warnings
 import sqlglot
 from sqlglot import exp
 from typing import List, Dict, Set, Any, Optional
@@ -7,6 +9,45 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+
+def build_llm(temperature: float | None = None) -> ChatOpenAI:
+    """保留企業級設定，預設溫度設為 0 以確保血緣精準對齊"""
+    base_url = os.getenv("OPENAI_COMPAT_BASE_URL", "https://model-gateway.gclpgenaigw.gc.micron.com/api/v1")
+    api_key = os.getenv("OPENAI_COMPAT_API_KEY", "sk-dummy-key")
+    model = os.getenv("OPENAI_COMPAT_MODEL", "gpt-5.2-codex")
+    default_temperature = float(os.getenv("OPENAI_COMPAT_TEMPERATURE", "0.0"))
+    max_tokens_str = os.getenv("OPENAI_COMPAT_MAX_TOKENS", "")
+    thinking_level = os.getenv("GEMINI_THINKING_LEVEL", "HIGH")
+    disable_ssl_verify = os.getenv("OPENAI_COMPAT_VERIFY_SSL", "false").lower() in {"0", "false", "no"}
+
+    used_temperature = temperature if temperature is not None else default_temperature
+    os.environ["NO_PROXY"] = os.getenv("NO_PROXY", "gc.micron.com")
+    ssl_verify = not disable_ssl_verify
+
+    http_client = httpx.Client(verify=ssl_verify)
+    http_async_client = httpx.AsyncClient(verify=ssl_verify)
+    is_gemini = "gemini" in model.lower()
+
+    kwargs: dict[str, Any] = {
+        "base_url": base_url,
+        "api_key": api_key,
+        "model": model,
+        "temperature": used_temperature,
+        "http_client": http_client,
+        "http_async_client": http_async_client,
+        "use_responses_api": False,
+    }
+
+    if max_tokens_str.strip(): kwargs["max_completion_tokens"] = int(max_tokens_str)
+    if is_gemini and thinking_level: kwargs["extra_body"] = {"generation_config": {"thinking_config": {"thinking_level": thinking_level}}}
+
+    return ChatOpenAI(**kwargs)
 
 # ==========================================
 # 1. 結構化輸出模型 (Pydantic Models)
@@ -107,7 +148,7 @@ def node_analyze_backward(state: EngineState) -> dict:
         
         # 【混合解析 2】：呼叫 LLM 進行語意與漂移分析
         kb_context = state["knowledge_base"].get(target, "尚無此表的知識紀錄。")
-        llm = ChatOpenAI(model="gpt-4o", temperature=0).with_structured_output(AnalysisResult)
+        llm = build_llm(temperature=0.0).with_structured_output(AnalysisResult)
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", "你是一位精通企業級資料架構的 Data Architect。請基於提供的『AST 客觀結構』推斷隱含的業務邏輯與 DQ 規則。"
