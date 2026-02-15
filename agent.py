@@ -92,6 +92,7 @@ class ParsedTable(BaseModel):
     columns: List[TargetColumn] = Field(description="表內欄位定義與來源")
 
 class ChunkParseResult(BaseModel):
+    thinking: str = Field(description="請先用繁體中文詳細分析這段 SQL 的邏輯：包含哪些表、JOIN 關係、欄位來源與轉換邏輯，再據此填寫下方欄位")
     found_tables: List[ParsedTable] = Field(description="此 SQL 區塊中建立/更新的所有表")
 
 # ==========================================
@@ -305,7 +306,7 @@ def generate_report_node(state: SQLAnalysisState):
         for col_name, col_info in metadata[t_key]["columns"].items():
             desc = col_info["description"]
             paths = get_source_path(final_target, col_name)
-            src_str = " , ".join(paths) if paths else "Unknown"
+            src_str = " <br> ".join(paths) if paths else "Unknown"
             report.append(f"| `{col_name}` | {desc} | {src_str} |")
     else:
         report.append("| - | (無欄位資訊) | - |")
@@ -334,7 +335,7 @@ def generate_report_node(state: SQLAnalysisState):
         for col_name, col_info in t_info["columns"].items():
             c_desc = col_info["description"]
             paths = get_source_path(t_name, col_name)
-            src_str = " , ".join(paths) if paths else "Unknown"
+            src_str = " <br> ".join(paths) if paths else "Unknown"
             report.append(f"| `{col_name}` | {c_desc} | {src_str} |")
             
         report.append("")
