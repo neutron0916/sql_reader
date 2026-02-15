@@ -79,10 +79,6 @@ class SourceColumn(BaseModel):
     table_name: str = Field(description="來源表名 (例如 #LP, ORD_HDR)")
     column_name: str = Field(description="來源欄位名")
     is_physical: bool = Field(description="是否為實體表 (非 # 開頭且非 CTE)")
-    join_condition: str = Field(
-        default="",
-        description="此來源是透過什麼條件連接的，例如 'JOIN ON a.ID = b.ID' 或 'WHERE Status=A'。若無明確條件或為直接 SELECT 則留空"
-    )
 
 class TargetColumn(BaseModel):
     column_name: str = Field(description="產出的目標欄位名稱")
@@ -155,9 +151,6 @@ def analyze_backward_chunk_node(state: SQLAnalysisState):
         1. 找出區塊中被建立/更新的目標表。若 Pending List {pending_list} 不為空，優先尋找它們。若為空，找出最終產出表。
         2. 針對目標表，精準解析【各個欄位】直接來自哪個來源表與來源欄位。
         3. 【多對一處理】：若欄位由多表 JOIN / 運算而成，必須將所有來源列入 sources。
-        4. 【連接條件】：每個 source 必須填寫 join_condition，說明此來源表是透過什麼 JOIN / WHERE 條件連接的。
-           - 範例：'JOIN ON a.TechNode = b.TechNode AND a.Stage = b.Stage'
-           - 若為直接 SELECT（無 JOIN），則填空字串 ''。
         """),
         ("user", "【當前 SQL 區塊】:\n{chunk}")
     ])
@@ -205,7 +198,7 @@ def update_node(state: SQLAnalysisState):
             # 欄位解析與儲存 (包含 UPDATE 語句的欄位合併)
             for col in layer.columns:
                 col_name = col.column_name
-                sources_list = [{"table": s.table_name, "column": s.column_name, "join_condition": s.join_condition} for s in col.sources]
+                sources_list = [{"table": s.table_name, "column": s.column_name} for s in col.sources]
                 
                 if col_name not in table_metadata[target]["columns"]:
                     table_metadata[target]["columns"][col_name] = {
@@ -214,9 +207,8 @@ def update_node(state: SQLAnalysisState):
                     }
                 else:
                     for s in sources_list:
-                        existing = table_metadata[target]["columns"][col_name]["sources"]
-                        if not any(e["table"] == s["table"] and e["column"] == s["column"] for e in existing):
-                            existing.append(s)
+                        if s not in table_metadata[target]["columns"][col_name]["sources"]:
+                            table_metadata[target]["columns"][col_name]["sources"].append(s)
                             
                 # 將未處理的來源表推入 Pending List
                 for s in col.sources:
@@ -285,16 +277,14 @@ def generate_report_node(state: SQLAnalysisState):
         for src in sources:
             src_tb = src["table"]
             src_col = src["column"]
-            condition = src.get("join_condition", "")
-            cond_tag = f" `({condition})`" if condition else ""
             sub_paths = get_source_path(src_tb, src_col, visited.copy())
             
             # 若它還有來源，將其用 ---> 串接起來
             if sub_paths:
                 for sp in sub_paths:
-                    paths.append(f"{src_tb}{cond_tag} ---> {sp}")
+                    paths.append(f"{src_tb} ---> {sp}")
             else:
-                paths.append(f"{src_tb}{cond_tag}")
+                paths.append(f"{src_tb}")
                 
         # 去重 + 移除冗餘子路徑
         return _dedup_paths(list(dict.fromkeys(paths)))
