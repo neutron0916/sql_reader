@@ -179,7 +179,8 @@ def node_analyze_backward(state: EngineState) -> dict:
         
         try:
             print(f"   🧠 AI 語意分析中...")
-            ai_res: AnalysisResult = llm.invoke({
+            chain = prompt | llm
+            ai_res: AnalysisResult = chain.invoke({
                 "target": target, "ast": json.dumps(ast_info, ensure_ascii=False), "sql": chunk, "kb": kb_context
             })
             
