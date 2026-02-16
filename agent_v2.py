@@ -1,19 +1,15 @@
-import json
 import os
-import warnings
+import re
+import json
+import httpx
 import sqlglot
 from sqlglot import exp
-from typing import List, Dict, Set, Any, Optional
+from typing import Any, List, Dict, Set, Optional
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-import httpx
-from dotenv import load_dotenv
-
-load_dotenv()
-warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 
 def build_llm(temperature: float | None = None) -> ChatOpenAI:
@@ -29,7 +25,7 @@ def build_llm(temperature: float | None = None) -> ChatOpenAI:
     used_temperature = temperature if temperature is not None else default_temperature
     os.environ["NO_PROXY"] = os.getenv("NO_PROXY", "gc.micron.com")
     ssl_verify = not disable_ssl_verify
-
+    
     http_client = httpx.Client(verify=ssl_verify)
     http_async_client = httpx.AsyncClient(verify=ssl_verify)
     is_gemini = "gemini" in model.lower()
@@ -58,7 +54,7 @@ class ColumnTransformation(BaseModel):
     business_meaning: str = Field(description="此公式在業務上的意義 (如: 計算稅後淨利)")
 
 class DriftDetection(BaseModel):
-    has_conflict: bool = Field(description="SQL 過濾條件是否與知識庫描述發生衝突？")
+    has_conflict: bool = Field(description="SQL 邏輯是否與知識庫描述發生衝突？")
     warning_message: Optional[str] = Field(None, description="若有衝突，說明原因給人類審查")
 
 class AnalysisResult(BaseModel):
@@ -71,265 +67,338 @@ class AnalysisResult(BaseModel):
 # 2. 靈魂狀態機定義 (LangGraph State)
 # ==========================================
 class EngineState(TypedDict):
-    chunks: List[str]                  # 由 chunk_mssql_sql 切割好的 SQL 區塊
-    current_idx: int                   # Bottom-Up 逆向追蹤指標
-    pending_list: List[str]            # 【核心靈魂】：等待解析的 Temp/CTE 依賴清單
-    resolved_tables: Set[str]          # 防無限迴圈的已解析清單
-    knowledge_base: Dict[str, str]     # 既有知識庫 (Table -> Markdown)
-    
-    # 產出物 (Artifacts)
+    chunks: List[str]                  
+    current_idx: int                   
+    pending_list: List[str]            
+    resolved_tables: Set[str]          
+    knowledge_base: Dict[str, str]     
     nodes: Dict[str, dict]
     edges: List[dict]
     drift_warnings: List[str]
 
 # ==========================================
-# 3. Hybrid Parser: AST 確定性地基提取
+# 3. MSSQL 智能切割器 (The Chunker)
+# ==========================================
+def chunk_mssql_sql(raw_sql: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
+    lines = raw_sql.splitlines()
+    marker_pattern = re.compile(r"^\s*---\s*CHUNK\s+BOUNDARY\s*---")
+    
+    if any(marker_pattern.match(l) for l in lines):
+        chunks, current = [], []
+        for line in lines:
+            if marker_pattern.match(line):
+                if current: chunks.append("\n".join(current))
+                current = []
+            else: current.append(line)
+        if current: chunks.append("\n".join(current).strip())
+        return [c.strip() for c in chunks if c.strip()]
+        
+    total = len(lines)
+    chunks, start = [], 0
+    while start < total:
+        end = min(start + chunk_size, total)
+        chunk_text = "\n".join(lines[start:end]).strip()
+        if chunk_text: chunks.append(chunk_text)
+        if end >= total: break
+        start = end - overlap
+    return chunks
+
+# ==========================================
+# 4. Hybrid Parser: AST 確定性地基提取
 # ==========================================
 def extract_ast_ground_truth(sql_chunk: str) -> dict:
-    """提取絕對客觀的語法結構，消除 LLM 幻覺"""
     info = {"target": None, "sources": set(), "expressions": {}}
     try:
         parsed = sqlglot.parse_one(sql_chunk, read="tsql")
-        
-        # 1. 提取 目標表 (SELECT INTO, INSERT)
+        if not parsed: return info
+            
+        # 提取 目標表 (SELECT INTO, INSERT)
         for into in parsed.find_all(exp.Into):
             if isinstance(into.this, exp.Table):
-                info["target"] = into.this.name
+                info["target"] = into.this.name.upper()
         if not info["target"] and isinstance(parsed, exp.Insert):
-            info["target"] = parsed.this.name
+            info["target"] = parsed.this.name.upper()
             
-        # 2. 提取 來源表 (排除 Target 自己)
+        # 提取 來源表 (排除 Target 自己)
         for table in parsed.find_all(exp.Table):
-            if table.name and table.name != info["target"]:
-                info["sources"].add(table.name)
+            t_name = table.name.upper()
+            if t_name and t_name != info["target"]:
+                info["sources"].add(t_name)
                 
-        # 3. 提取 欄位級公式 (e.g., Price * (1 - Rate))
+        # 提取 欄位級公式
         for select in parsed.find_all(exp.Select):
             for proj in select.expressions:
                 if isinstance(proj, exp.Alias):
                     info["expressions"][proj.alias] = proj.this.sql(dialect="tsql")
-                elif isinstance(proj, exp.Column):
-                    info["expressions"][proj.name] = proj.sql(dialect="tsql")
-    except Exception as e:
-        pass # 容錯處理：極端方言降級
+    except Exception:
+        pass 
         
     info["sources"] = list(info["sources"])
     return info
 
 # ==========================================
-# 4. LangGraph 節點：逆向追蹤與語意引擎
+# 5. LangGraph 節點：逆向追蹤與語意引擎
 # ==========================================
 def node_analyze_backward(state: EngineState) -> dict:
     idx = state["current_idx"]
     chunk = state["chunks"][idx]
+    
     pending = list(state["pending_list"])
     resolved = set(state["resolved_tables"])
-    nodes, edges = dict(state["nodes"]), list(state["edges"])
+    nodes = dict(state["nodes"])
+    edges = list(state["edges"])
     drifts = list(state["drift_warnings"])
     
-    # 【混合解析 1】：取得 AST Ground Truth
     ast_info = extract_ast_ground_truth(chunk)
-    target = ast_info["target"] or f"Unknown_Target_{idx}"
+    target = ast_info["target"] or f"UNKNOWN_TARGET_{idx}"
     
-    # 【核心演算法剪枝】：只解析「最終目標表」或「在 Pending List 中的表」
+    # 【核心演算法剪枝】：判斷是否為「最終輸出目標」或「處於 Pending List 的依賴」
     is_final_chunk = (idx == len(state["chunks"]) - 1)
+    
     if is_final_chunk or target in pending:
+        print(f"🔍 [Bottom-Up 追蹤] 正在解析目標表: {target} (Chunk Index: {idx})")
         
-        # 從 Pending List 消滅，並加入 Resolved
-        if target in pending:
-            pending.remove(target)
+        if target in pending: pending.remove(target)
         resolved.add(target)
         
-        # 將尚未解析的上游依賴推入 Pending List (逆向生長)
+        # 逆向生長：將未知依賴 (#Temp 或 CTE) 推入 Pending
         for src in ast_info["sources"]:
-            if (src.startswith("#") or src.upper().startswith("CTE")) and src not in resolved:
-                if src not in pending:
-                    pending.append(src)
+            if (src.startswith("#") or src.startswith("CTE")) and src not in resolved and src not in pending:
+                pending.append(src)
+                print(f"   ➔ 發現暫存上游依賴，推入 Pending List: {src}")
         
-        # 【混合解析 2】：呼叫 LLM 進行語意與漂移分析
+        # 呼叫 LLM 進行語意與漂移分析
         kb_context = state["knowledge_base"].get(target, "尚無此表的知識紀錄。")
-        llm = build_llm(temperature=0.0).with_structured_output(AnalysisResult)
+        llm = build_llm(temperature=0).with_structured_output(AnalysisResult)
         
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "你是一位精通企業級資料架構的 Data Architect。請基於提供的『AST 客觀結構』推斷隱含的業務邏輯與 DQ 規則。"
-                       "【嚴格任務】：比對 SQL 邏輯與現有知識庫，若發現 WHERE 條件等業務邏輯與知識庫衝突，務必觸發 drift_check 警告！不要盲目覆蓋。"),
+            ("system", "你是一位精通企業級資料架構的 Data Architect。基於『AST 客觀結構』推斷業務邏輯。\n"
+                       "【嚴格任務】：比對 SQL 邏輯與現有知識庫，若發現 WHERE 條件等業務邏輯發生衝突，務必將 has_conflict 設為 True 並發出警告！"),
             ("user", "Target Table: {target}\nAST 解析結果: {ast}\n\n原始 SQL: {sql}\n\n現有知識庫: {kb}")
         ])
         
-        ai_res: AnalysisResult = llm.invoke({
-            "target": target, "ast": json.dumps(ast_info), "sql": chunk, "kb": kb_context
-        })
-        
-        # --- 構建視覺化與 JSON 資料 ---
-        nodes[target] = {
-            "id": target, "label": target,
-            "type": "Temp" if target.startswith("#") else "Physical",
-            "business_logic": ai_res.business_logic,
-            "dq_rules": ai_res.data_quality_rules
-        }
-        
-        # 建立 Edge，並將「轉換公式」封裝為 HTML 供 Vis.js Hover 顯示
-        for src in ast_info["sources"]:
-            if src not in nodes: # 補齊 Source Node
-                nodes[src] = {"id": src, "label": src, "type": "Physical", "business_logic": "Source Table", "dq_rules": []}
-            
-            tooltip_html = "<div style='font-family: monospace; padding: 4px;'><b style='color:#60a5fa'>Column Transformations:</b><br/>"
-            for t in ai_res.transformations:
-                tooltip_html += f"• <b>{t.target_column}</b> = <span style='color:#cbd5e1'>{t.source_expression}</span> <i style='color:#94a3b8'>({t.business_meaning})</i><br/>"
-            tooltip_html += "</div>"
-            
-            edges.append({
-                "from": src, "to": target,
-                "title": tooltip_html, # Vis.js 原生支援 HTML Title Hover
-                "transformations": [t.dict() for t in ai_res.transformations] # Machine Readable
+        try:
+            print(f"   🧠 AI 語意分析中...")
+            ai_res: AnalysisResult = llm.invoke({
+                "target": target, "ast": json.dumps(ast_info, ensure_ascii=False), "sql": chunk, "kb": kb_context
             })
             
-        # 收集 Semantic Drift
-        if ai_res.drift_check.has_conflict:
-            drifts.append(f"**Table `{target}`**: {ai_res.drift_check.warning_message}")
+            # --- 構建節點與連線 ---
+            nodes[target] = {
+                "id": target, "label": target,
+                "type": "Temp" if target.startswith("#") else "Physical",
+                "business_logic": ai_res.business_logic,
+                "dq_rules": ai_res.data_quality_rules
+            }
             
+            for src in ast_info["sources"]:
+                if src not in nodes:
+                    nodes[src] = {"id": src, "label": src, "type": "Physical", "business_logic": "Raw Source", "dq_rules": []}
+                
+                tooltip_html = "<div style='font-family: monospace; padding: 4px;'><b style='color:#60a5fa'>Transformations:</b><br/>"
+                for t in ai_res.transformations:
+                    tooltip_html += f"• <b>{t.target_column}</b> = <span style='color:#cbd5e1'>{t.source_expression}</span><br/><i style='color:#94a3b8; font-size: 11px;'>({t.business_meaning})</i><br/>"
+                tooltip_html += "</div>"
+                
+                edges.append({
+                    "from": src, "to": target,
+                    "title": tooltip_html,
+                    "transformations": [t.model_dump() for t in ai_res.transformations]
+                })
+                
+            if ai_res.drift_check.has_conflict:
+                drifts.append(f"**Table `{target}`**: {ai_res.drift_check.warning_message}")
+                print(f"   ⚠️ 攔截到語意衝突 (Semantic Drift)！")
+                
+        except Exception as e:
+            print(f"   ❌ LLM 分析失敗 ({target}): {e}")
+            
+    else:
+        print(f"⏭️ [Bottom-Up 剪枝] 略過無關廢棄 Chunk (Target: {target}, Index: {idx})")
+
     return {
-        "current_idx": idx - 1, # 繼續由後往前推進
+        "current_idx": idx - 1,
         "pending_list": pending,
         "resolved_tables": resolved,
         "nodes": nodes, "edges": edges, "drift_warnings": drifts
     }
 
 def router_should_continue(state: EngineState) -> str:
-    # 當追蹤到最源頭 (idx < 0) 或 pending_list 清空時，結束解析進入產出
+    # 只要指標小於 0 結束。 
+    # 【Early Stop】：如果 pending_list 空了，代表逆向追蹤的依賴網已經閉環，後面的廢棄程式碼可以直接跳過！
     if state["current_idx"] < 0 or (len(state["pending_list"]) == 0 and len(state["resolved_tables"]) > 0):
         return "generate"
     return "analyze"
 
 # ==========================================
-# 5. 生成標準化輸出與現代化儀表板
+# 6. 生成標準化輸出與現代化儀表板
 # ==========================================
 def node_generate_outputs(state: EngineState) -> dict:
     nodes_data = list(state["nodes"].values())
     edges_data = state["edges"]
     
-    # 1. 輸出 Machine Readable JSON (未來可整合 OpenLineage)
-    lineage_export = {"nodes": nodes_data, "edges": edges_data}
     with open("lineage_graph.json", "w", encoding="utf-8") as f:
-        json.dump(lineage_export, f, indent=2, ensure_ascii=False)
+        json.dump({"nodes": nodes_data, "edges": edges_data}, f, indent=2, ensure_ascii=False)
         
-    # 2. 帶有衝突檢測的 Markdown (Zero-Trust)
     with open("semantic_drift_report.md", "w", encoding="utf-8") as f:
         f.write("# 🛡️ SQL Semantic & Knowledge Base Update Report\n\n")
         if state["drift_warnings"]:
-            f.write("## ⚠️ Semantic Drift / Conflict Warnings\n> **System Notice:** 系統偵測到本次 SQL 邏輯與現有知識庫存在衝突。請在更新 `dictionary_knowledge.md` 前進行人類審查：\n\n")
+            f.write("## ⚠️ Semantic Drift / Conflict Warnings\n> **System Notice:** 系統偵測到衝突，請在更新知識庫前進行人類審查：\n\n")
             for w in state["drift_warnings"]:
                 f.write(f"- {w}\n")
         else:
             f.write("> ✅ 未偵測到業務邏輯衝突，可安全 Upsert。\n")
 
-    # 3. 現代化單頁互動 HTML (Vis.js + Tailwind)
-    html_template = f"""
+    # 使用 replace 注入 JSON，徹底避免 Python f-string 破壞 JS/CSS 大括號
+    html_template = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>Enterprise SQL Lineage Dashboard</title>
+        <title>Enterprise SQL Lineage</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
         <style>
-            #network {{ width: 100%; height: 100vh; outline: none; background-color: #0f172a; }}
-            div.vis-tooltip {{ background-color: #1e293b; color: #f8fafc; border: 1px solid #334155; border-radius: 6px; font-size: 13px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5); }}
+            #network { width: 100%; height: 100vh; background-color: #0f172a; outline: none; }
+            div.vis-tooltip { background-color: #1e293b; color: #f8fafc; border: 1px solid #334155; border-radius: 6px; padding: 10px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.5); z-index: 10;}
         </style>
     </head>
     <body class="flex overflow-hidden font-sans text-slate-200">
-        
         <div class="flex-grow relative h-screen">
-            <div class="absolute top-6 left-6 z-10 bg-slate-800 p-2 rounded-lg shadow-lg flex gap-2 border border-slate-700">
-                <input type="text" id="searchInput" placeholder="Search Table/Column..." class="bg-slate-900 border border-slate-600 p-2 text-sm rounded outline-none focus:ring-2 focus:ring-blue-500 w-64 text-slate-200">
-                <button onclick="searchNode()" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded text-sm transition-colors font-semibold">Search</button>
-            </div>
             <div id="network"></div>
         </div>
-
-        <div id="sidebar" class="w-96 bg-slate-800 border-l border-slate-700 shadow-2xl flex flex-col h-full transform transition-transform duration-300 translate-x-full absolute right-0 z-20">
-            <div class="p-6 overflow-y-auto h-full">
-                <div class="flex justify-between items-center mb-6 border-b border-slate-700 pb-4">
-                    <div>
-                        <h2 id="sb-title" class="text-2xl font-bold text-blue-400 break-all">Node Name</h2>
-                        <span id="sb-type" class="inline-block mt-2 px-2 py-1 bg-slate-700 text-slate-300 text-xs font-semibold rounded uppercase tracking-wider">Type</span>
-                    </div>
-                    <button onclick="closeSidebar()" class="text-slate-500 hover:text-red-400 text-2xl transition-colors">&times;</button>
-                </div>
-                
-                <h3 class="text-xs uppercase font-bold text-slate-500 mb-2 tracking-wider">🧠 AI Business Logic</h3>
-                <p id="sb-logic" class="text-sm bg-slate-900 p-4 rounded-lg border border-slate-700 mb-6 leading-relaxed text-slate-300"></p>
-                
-                <h3 class="text-xs uppercase font-bold text-rose-500 mb-2 tracking-wider flex items-center gap-2">🛡️ Data Quality Rules</h3>
-                <ul id="sb-dq" class="list-disc pl-5 text-sm space-y-2 text-rose-400 bg-rose-950/20 p-4 rounded-lg border border-rose-900/50"></ul>
+        <div id="sidebar" class="w-96 bg-slate-800 border-l border-slate-700 p-6 absolute right-0 h-full transform transition-transform translate-x-full z-20 shadow-2xl">
+            <div class="flex justify-between items-center mb-6">
+                <h2 id="sb-title" class="text-xl font-bold text-blue-400">Node Name</h2>
+                <button onclick="closeSidebar()" class="text-3xl hover:text-red-400">&times;</button>
             </div>
+            <h3 class="text-xs uppercase font-bold text-slate-500 mb-2">🧠 AI Business Logic</h3>
+            <p id="sb-logic" class="text-sm bg-slate-900 p-4 rounded-lg mb-6 border border-slate-700 text-slate-300"></p>
+            <h3 class="text-xs uppercase font-bold text-rose-500 mb-2">🛡️ Data Quality Rules</h3>
+            <ul id="sb-dq" class="list-disc pl-5 text-sm space-y-2 text-rose-400 bg-rose-950/20 p-4 rounded-lg border border-rose-900/50"></ul>
         </div>
-
         <script>
-            const nodesDict = {json.dumps(state["nodes"])};
-            const nodes = new vis.DataSet({json.dumps([{"id": n["id"], "label": n["label"], "group": n["type"]} for n in nodes_data])});
-            const edges = new vis.DataSet({json.dumps(edges_data)});
+            const nodesDict = __NODES_DICT__;
+            const nodesData = __NODES_DATA__;
+            const edgesData = __EDGES_DATA__;
             
-            const options = {{
-                nodes: {{ shape: 'box', margin: 14, font: {{ size: 14, color: '#f8fafc', face: 'monospace' }}, borderWidth: 2 }},
-                groups: {{
-                    Physical: {{ color: {{ background: '#1e293b', border: '#3b82f6' }} }},
-                    Temp: {{ color: {{ background: '#334155', border: '#94a3b8' }}, shapeProperties: {{ borderDashes: [5, 5] }} }}
-                }},
-                edges: {{ color: '#64748b', smooth: {{ type: 'cubicBezier' }}, width: 2, arrows: 'to' }},
-                interaction: {{ hover: true }},
-                layout: {{ hierarchical: {{ direction: 'LR', sortMethod: 'directed', levelSeparation: 250 }} }}
-            }};
+            const nodes = new vis.DataSet(nodesData.map(n => ({id: n.id, label: n.label, group: n.type})));
+            const edges = new vis.DataSet(edgesData);
+            
+            const options = {
+                nodes: { shape: 'box', margin: 10, font: { color: '#fff', face: 'monospace' }, borderWidth: 2 },
+                groups: {
+                    Physical: { color: { background: '#1e293b', border: '#3b82f6' } },
+                    Temp: { color: { background: '#334155', border: '#94a3b8' }, shapeProperties: { borderDashes: [5, 5] } }
+                },
+                edges: { color: '#64748b', arrows: 'to', smooth: { type: 'cubicBezier' }, width: 2 },
+                interaction: { hover: true },
+                layout: { hierarchical: { direction: 'LR', sortMethod: 'directed', levelSeparation: 250 } }
+            };
 
-            const network = new vis.Network(document.getElementById('network'), {{nodes, edges}}, options);
+            const network = new vis.Network(document.getElementById('network'), {nodes, edges}, options);
 
-            // Node Click -> Open Sidebar
-            network.on("click", function (params) {{
-                if (params.nodes.length > 0) {{
-                    const nodeId = params.nodes[0];
-                    const info = nodesDict[nodeId] || {{}};
-                    
-                    document.getElementById('sb-title').innerText = nodeId;
-                    document.getElementById('sb-type').innerText = info.type || 'Unknown';
-                    document.getElementById('sb-logic').innerText = info.business_logic || "No logic found.";
-                    
-                    const dqList = document.getElementById('sb-dq');
-                    dqList.innerHTML = info.dq_rules && info.dq_rules.length > 0 ? 
-                        info.dq_rules.map(r => `<li>${{r}}</li>`).join('') : 
-                        '<li class="text-emerald-500 list-none font-semibold">✅ No DQ risks detected.</li>';
-                        
+            network.on("click", function (params) {
+                if (params.nodes.length > 0) {
+                    const info = nodesDict[params.nodes[0]] || {};
+                    document.getElementById('sb-title').innerText = params.nodes[0];
+                    document.getElementById('sb-logic').innerText = info.business_logic || "N/A";
+                    document.getElementById('sb-dq').innerHTML = info.dq_rules ? info.dq_rules.map(r => `<li>${r}</li>`).join('') : '';
                     document.getElementById('sidebar').classList.remove('translate-x-full');
-                }} else {{ closeSidebar(); }}
-            }});
-
-            function closeSidebar() {{ document.getElementById('sidebar').classList.add('translate-x-full'); }}
-            
-            function searchNode() {{
-                const val = document.getElementById('searchInput').value.toLowerCase();
-                const found = nodes.get().find(n => n.label.toLowerCase().includes(val));
-                if(found) {{
-                    network.selectNodes([found.id]);
-                    network.focus(found.id, {{ scale: 1.2, animation: {{ duration: 500 }} }});
-                    network.emit("click", {{ nodes: [found.id] }});
-                }}
-            }}
+                } else { closeSidebar(); }
+            });
+            function closeSidebar() { document.getElementById('sidebar').classList.add('translate-x-full'); }
         </script>
     </body>
     </html>
     """
+    html_content = html_template.replace("__NODES_DICT__", json.dumps(state["nodes"]))
+    html_content = html_content.replace("__NODES_DATA__", json.dumps(nodes_data))
+    html_content = html_content.replace("__EDGES_DATA__", json.dumps(edges_data))
+    
     with open("dashboard.html", "w", encoding="utf-8") as f:
-        f.write(html_template)
+        f.write(html_content)
+    
+    print("\n📁 產出物已存檔：dashboard.html, semantic_drift_report.md, lineage_graph.json")
     return state
 
 # ==========================================
-# 6. 編譯引擎
+# 7. 編譯與執行主入口 (Main Block)
 # ==========================================
-workflow = StateGraph(EngineState)
-workflow.add_node("analyze", node_analyze_backward)
-workflow.add_node("generate", node_generate_outputs)
+if __name__ == "__main__":
+    
+    # 防呆檢查 API Key
+    if not os.environ.get("OPENAI_API_KEY"):
+        print("❌ 錯誤：找不到 OPENAI_API_KEY 環境變數。")
+        print("💡 請在終端機輸入：export OPENAI_API_KEY='sk-你的金鑰'")
+        exit(1)
 
-workflow.set_entry_point("analyze")
-workflow.add_conditional_edges("analyze", router_should_continue, {"analyze": "analyze", "generate": "generate"})
-workflow.add_edge("generate", END)
+    # --- 模擬 1：真實世界的巨石 T-SQL ---
+    sample_sql = """
+    -- Chunk 1: 這是一段從未被最終結果引用的「孤兒/廢棄代碼」，驗證引擎會把它【剪枝跳過】！
+    SELECT * INTO #Temp_DeadCode FROM T_Old_Logs WHERE Date < '2023-01-01';
+    GO
 
-engine = workflow.compile()
+    -- Chunk 2: 從底層抽取活躍客戶
+    SELECT UserID, UserName, Status 
+    INTO #Temp_ActiveUsers 
+    FROM T_Base_Users 
+    WHERE Status = 'Active';
+    GO
+
+    -- Chunk 3: 計算客戶訂單折扣後金額 (測試欄位轉換公式提取)
+    SELECT o.OrderID, o.UserID, o.Price * (1 - o.DiscountRate) AS Net_Price 
+    INTO #Temp_Orders 
+    FROM T_Base_Orders o;
+    GO
+
+    -- Chunk 4: 最終聚合 (這是 Bottom-up 演算法的起點)
+    SELECT u.UserName, SUM(o.Net_Price) AS Total_Revenue
+    INTO T_Final_Report
+    FROM #Temp_ActiveUsers u
+    LEFT JOIN #Temp_Orders o ON u.UserID = o.UserID
+    GROUP BY u.UserName;
+    """
+
+    # --- 模擬 2：現有知識庫 ---
+    mock_knowledge_base = {
+        "T_Base_Users": "系統底層使用者表。",
+        # 故意製造知識庫衝突 (舊版包含 Pending，但 SQL 寫 Active)
+        "#TEMP_ACTIVEUSERS": "活躍客戶表。注意：依據舊版定義，包含 Status = 'Pending' 的客戶。", 
+        "T_FINAL_REPORT": "最終營收報表。"
+    }
+
+    print("🚀 [系統啟動] 正在啟動企業級 SQL 語意與血緣分析引擎...")
+    
+    # 1. 執行 Chunking (切割)
+    chunks = chunk_mssql_sql(sample_sql)
+    print(f"📦 共切割出 {len(chunks)} 個 SQL 區塊。")
+
+    # 2. 建立 LangGraph
+    workflow = StateGraph(EngineState)
+    workflow.add_node("analyze", node_analyze_backward)
+    workflow.add_node("generate", node_generate_outputs)
+    workflow.set_entry_point("analyze")
+    workflow.add_conditional_edges("analyze", router_should_continue, {"analyze": "analyze", "generate": "generate"})
+    workflow.add_edge("generate", END)
+    engine = workflow.compile()
+
+    # 3. 初始化 LangGraph 狀態 (設定從最後一個 Chunk 開始 Bottom-Up)
+    initial_state = {
+        "chunks": chunks,
+        "current_idx": len(chunks) - 1, 
+        "pending_list": [], 
+        "resolved_tables": set(),
+        "knowledge_base": mock_knowledge_base,
+        "nodes": {},
+        "edges": [],
+        "drift_warnings": []
+    }
+
+    # 4. 執行引擎
+    print("\n🕸️ 開始執行 LangGraph 逆向狀態機演算法...")
+    engine.invoke(initial_state)
+    
+    print("\n=======================================================")
+    print(" 🎉 執行完畢！您可以直接在瀏覽器開啟 `dashboard.html`")
+    print("=======================================================")
