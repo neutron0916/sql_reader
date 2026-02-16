@@ -326,52 +326,26 @@ def node_generate_outputs(state: EngineState) -> dict:
 # 7. 編譯與執行主入口 (Main Block)
 # ==========================================
 if __name__ == "__main__":
-    
-    # 防呆檢查 API Key
-    if not os.environ.get("OPENAI_API_KEY"):
-        print("❌ 錯誤：找不到 OPENAI_API_KEY 環境變數。")
-        print("💡 請在終端機輸入：export OPENAI_API_KEY='sk-你的金鑰'")
-        exit(1)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    sql_path = os.path.join(script_dir, "ins_TechNodeFlow.sql")
 
-    # --- 模擬 1：真實世界的巨石 T-SQL ---
-    sample_sql = """
-    -- Chunk 1: 這是一段從未被最終結果引用的「孤兒/廢棄代碼」，驗證引擎會把它【剪枝跳過】！
-    SELECT * INTO #Temp_DeadCode FROM T_Old_Logs WHERE Date < '2023-01-01';
-    GO
-
-    -- Chunk 2: 從底層抽取活躍客戶
-    SELECT UserID, UserName, Status 
-    INTO #Temp_ActiveUsers 
-    FROM T_Base_Users 
-    WHERE Status = 'Active';
-    GO
-
-    -- Chunk 3: 計算客戶訂單折扣後金額 (測試欄位轉換公式提取)
-    SELECT o.OrderID, o.UserID, o.Price * (1 - o.DiscountRate) AS Net_Price 
-    INTO #Temp_Orders 
-    FROM T_Base_Orders o;
-    GO
-
-    -- Chunk 4: 最終聚合 (這是 Bottom-up 演算法的起點)
-    SELECT u.UserName, SUM(o.Net_Price) AS Total_Revenue
-    INTO T_Final_Report
-    FROM #Temp_ActiveUsers u
-    LEFT JOIN #Temp_Orders o ON u.UserID = o.UserID
-    GROUP BY u.UserName;
-    """
-
-    # --- 模擬 2：現有知識庫 ---
-    mock_knowledge_base = {
-        "T_Base_Users": "系統底層使用者表。",
-        # 故意製造知識庫衝突 (舊版包含 Pending，但 SQL 寫 Active)
-        "#TEMP_ACTIVEUSERS": "活躍客戶表。注意：依據舊版定義，包含 Status = 'Pending' 的客戶。", 
-        "T_FINAL_REPORT": "最終營收報表。"
-    }
+    try:
+        with open(sql_path, "r", encoding="utf-8") as f:
+            raw_sql = f.read()
+    except FileNotFoundError:
+        print(f"⚠️ 找不到 {sql_path}，使用測試 SQL 模擬。")
+        raw_sql = """
+        SELECT ID, Dept INTO #LP FROM Base_Dept;
+        --- CHUNK BOUNDARY ---
+        SELECT a.ID, a.Dept, b.Salary INTO #CT FROM #LP a JOIN Base_Salary b ON a.ID = b.ID;
+        --- CHUNK BOUNDARY ---
+        SELECT Dept, SUM(Salary) AS Total_Salary INTO Final_Report FROM #CT GROUP BY Dept;
+        """
 
     print("🚀 [系統啟動] 正在啟動企業級 SQL 語意與血緣分析引擎...")
-    
+
     # 1. 執行 Chunking (切割)
-    chunks = chunk_mssql_sql(sample_sql)
+    chunks = chunk_mssql_sql(raw_sql)
     print(f"📦 共切割出 {len(chunks)} 個 SQL 區塊。")
 
     # 2. 建立 LangGraph
@@ -386,10 +360,10 @@ if __name__ == "__main__":
     # 3. 初始化 LangGraph 狀態 (設定從最後一個 Chunk 開始 Bottom-Up)
     initial_state = {
         "chunks": chunks,
-        "current_idx": len(chunks) - 1, 
-        "pending_list": [], 
+        "current_idx": len(chunks) - 1,
+        "pending_list": [],
         "resolved_tables": set(),
-        "knowledge_base": mock_knowledge_base,
+        "knowledge_base": {},
         "nodes": {},
         "edges": [],
         "drift_warnings": []
@@ -398,7 +372,7 @@ if __name__ == "__main__":
     # 4. 執行引擎
     print("\n🕸️ 開始執行 LangGraph 逆向狀態機演算法...")
     engine.invoke(initial_state)
-    
+
     print("\n=======================================================")
     print(" 🎉 執行完畢！您可以直接在瀏覽器開啟 `dashboard.html`")
     print("=======================================================")
