@@ -79,16 +79,6 @@ class SourceColumn(BaseModel):
     table_name: str = Field(description="來源表名 (例如 #LP, ORD_HDR)")
     column_name: str = Field(description="來源欄位名")
     is_physical: bool = Field(description="是否為實體表 (非 # 開頭且非 CTE)")
-    derivation_type: str = Field(
-        default="DIRECT",
-        description="此欄位如何從來源取得: "
-                    "'DIRECT' (直接選取/重命名), "
-                    "'JOIN' (透過 JOIN 帶入), "
-                    "'AGGREGATE' (聚合如 SUM/COUNT/MAX), "
-                    "'WINDOW_FUNC' (窗口函數如 SUM() OVER / ROW_NUMBER), "
-                    "'CASE_WHEN' (條件分支), "
-                    "'EXPRESSION' (數學/字串運算)"
-    )
 
 class TargetColumn(BaseModel):
     column_name: str = Field(description="產出的目標欄位名稱")
@@ -208,7 +198,7 @@ def update_node(state: SQLAnalysisState):
             # 欄位解析與儲存 (包含 UPDATE 語句的欄位合併)
             for col in layer.columns:
                 col_name = col.column_name
-                sources_list = [{"table": s.table_name, "column": s.column_name, "derivation": s.derivation_type} for s in col.sources]
+                sources_list = [{"table": s.table_name, "column": s.column_name} for s in col.sources]
                 
                 if col_name not in table_metadata[target]["columns"]:
                     table_metadata[target]["columns"][col_name] = {
@@ -262,7 +252,7 @@ def generate_report_node(state: SQLAnalysisState):
         filtered = []
         for p in candidates:
             is_subpath = any(
-                other != p and other.endswith(f"--> {p}")
+                other != p and other.endswith(f" ---> {p}")
                 for other in candidates
             )
             if not is_subpath:
@@ -287,14 +277,12 @@ def generate_report_node(state: SQLAnalysisState):
         for src in sources:
             src_tb = src["table"]
             src_col = src["column"]
-            derivation = src.get("derivation", "DIRECT")
-            tag = f"--({derivation})-->"
             sub_paths = get_source_path(src_tb, src_col, visited.copy())
             
-            # 若它還有來源，將其用 --(TYPE)--> 串接起來
+            # 若它還有來源，將其用 ---> 串接起來
             if sub_paths:
                 for sp in sub_paths:
-                    paths.append(f"{src_tb} {tag} {sp}")
+                    paths.append(f"{src_tb} ---> {sp}")
             else:
                 paths.append(f"{src_tb}")
                 
